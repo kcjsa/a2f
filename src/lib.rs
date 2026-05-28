@@ -39,7 +39,6 @@ struct SessionState {
     sliding_window: SlidingWindow,
 }
 
-/// 送信側
 pub struct A2FSender {
     session_id: u64,           
     crypto: MultiLayerCrypto,
