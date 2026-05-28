@@ -107,3 +107,5 @@ kcjsa on GitHub
 
 https://qiita.com/kcjsa/items/c28c2201349c6d38361d
 
+## A lighter version of the A2F, the A2F-EL, is now available!!!
+https://github.com/kcjsa/a2f-EL
