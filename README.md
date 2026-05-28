@@ -41,7 +41,7 @@ Add to your Cargo.toml:
 [dependencies]
 a2f = { git = "https://github.com/kcjsa/a2f" }
 もしくは 
-a2f = "0.3.0"
+a2f = "0.4.0"
 
 Basic usage example:
 ```
