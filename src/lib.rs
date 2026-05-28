@@ -1,4 +1,3 @@
-// ========== src/lib.rs ==========
 //! # A2F - Analysis to Fake Protocol
 //!
 //! 非同期・順不同・高遅延耐性を持つ暗号プロトコル
