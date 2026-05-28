@@ -19,16 +19,7 @@ use rand::RngCore;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use lazy_static::lazy_static;
-/*
-lazy_static! {
-    static ref GLOBAL_SEQ: AtomicU64 = AtomicU64::new({
-        use rand::Rng;
-        rand::thread_rng().gen_range(1..u64::MAX)
-    });
-}*/
 
-/// 現在のタイムスタンプをミリ秒単位で取得
 pub fn current_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -36,15 +27,22 @@ pub fn current_timestamp() -> u64 {
         .as_millis() as u64
 }
 
-// 一時的に固定値に変更
 static GLOBAL_SEQ: AtomicU64 = AtomicU64::new(1);
 
 pub fn next_sequence() -> u64 {
     GLOBAL_SEQ.fetch_add(1, Ordering::SeqCst)
 }
 
+struct SessionState {
+    crypto: MultiLayerCrypto,
+    buffer: TimestampBuffer,
+    pending_keys: HashMap<u64, [u8; 32]>,
+    sliding_window: SlidingWindow,
+}
+
 /// 送信側
 pub struct A2FSender {
+    session_id: u64,           
     crypto: MultiLayerCrypto,
     shuffler: ShuffleScheduler,
     current_session_key: Option<[u8; 32]>,
@@ -53,7 +51,9 @@ pub struct A2FSender {
 
 impl A2FSender {
     pub fn new(master_key: [u8; 32], config: &A2FConfig) -> Self {
+        let session_id = rand::thread_rng().next_u64();
         Self {
+            session_id,
             crypto: MultiLayerCrypto::new(master_key),
             shuffler: config.into_scheduler(),
             current_session_key: None,
@@ -61,11 +61,15 @@ impl A2FSender {
         }
     }
     
+    pub fn session_id(&self) -> u64 {
+        self.session_id
+    }
+    
     pub fn set_next_sequence(&mut self, seq: u64) {
         self.next_seq = seq;
     }
     
-    /// 新しいセッション鍵を生成し、ラップする
+
     pub fn generate_key_packet(&mut self, timestamp: u64) -> A2FResult<Packet> {
         let mut session_key = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut session_key);
@@ -75,10 +79,10 @@ impl A2FSender {
         let seq = self.next_seq;
         self.next_seq += 1;
         
-        Ok(Packet::new(seq, timestamp, PayloadType::WrappedKey, wrapped))
+        Ok(Packet::new(self.session_id, seq, timestamp, PayloadType::WrappedKey, wrapped))
     }
     
-    /// データを暗号化する
+
     pub fn encrypt_data(&mut self, data: &[u8], timestamp: u64) -> A2FResult<Packet> {
         let session_key = self.current_session_key
             .ok_or_else(|| A2FError::ConfigError("セッション鍵が生成されていません".into()))?;
@@ -87,10 +91,9 @@ impl A2FSender {
         let seq = self.next_seq;
         self.next_seq += 1;
         
-        Ok(Packet::new(seq, timestamp, PayloadType::EncryptedData, encrypted))
+        Ok(Packet::new(self.session_id, seq, timestamp, PayloadType::EncryptedData, encrypted))
     }
-    
-    /// データを送信（内部で自動的に鍵を生成）
+
     pub fn send_data(&mut self, data: &[u8]) -> A2FResult<Vec<Packet>> {
         let ts = current_timestamp();
         let key_packet = self.generate_key_packet(ts)?;
@@ -101,8 +104,7 @@ impl A2FSender {
         
         Ok(packets)
     }
-    
-    /// 複数のデータチャンクを同じセッション鍵で送信
+
     pub fn send_multiple(&mut self, chunks: &[&[u8]]) -> A2FResult<Vec<Packet>> {
         if chunks.is_empty() {
             return Ok(vec![]);
@@ -124,27 +126,23 @@ impl A2FSender {
         Ok(all_packets)
     }
     
-    /// ダミーパケットを生成
     pub fn generate_dummy_packet(&mut self, timestamp: u64) -> Packet {
         let seq = self.next_seq;
         self.next_seq += 1;
-        Packet::dummy(seq, timestamp)
+        Packet::dummy(self.session_id, seq, timestamp)
     }
     
-    /// ハートビートパケットを生成
     pub fn generate_heartbeat_packet(&mut self, timestamp: u64) -> Packet {
         let seq = self.next_seq;
         self.next_seq += 1;
-        Packet::heartbeat(seq, timestamp)
+        Packet::heartbeat(self.session_id, seq, timestamp)
     }
     
-    /// パケットをシャッフルする
     pub fn shuffle_packets<T>(&mut self, packets: Vec<T>) -> Vec<T> {
         self.shuffler.shuffle_packets(packets)
     }
 }
 
-/// スライディングウィンドウ（リプレイ対策＋順序自由）
 struct SlidingWindow {
     window_size: u64,
     min_seq: u64,
@@ -189,48 +187,63 @@ impl SlidingWindow {
     }
 }
 
-/// 受信側
 pub struct A2FReceiver {
-    crypto: MultiLayerCrypto,
-    buffer: TimestampBuffer,
-    pending_keys: HashMap<u64, [u8; 32]>,
-    sliding_window: SlidingWindow,
+    master_key: [u8; 32],
+    config: A2FConfig,
+    sessions: HashMap<u64, SessionState>,  
 }
 
 impl A2FReceiver {
     pub fn new(master_key: [u8; 32], config: &A2FConfig) -> Self {
         Self {
-            crypto: MultiLayerCrypto::new(master_key),
-            buffer: TimestampBuffer::new(config.buffer_timeout_secs, config.buffer_max_size),
-            pending_keys: HashMap::new(),
-            sliding_window: SlidingWindow::new(config.replay_window_size),
+            master_key,
+            config: config.clone(),
+            sessions: HashMap::new(),
         }
     }
     
+    fn get_or_create_session(&mut self, session_id: u64) -> &mut SessionState {
+        self.sessions.entry(session_id).or_insert_with(|| {
+            let crypto = MultiLayerCrypto::new(self.master_key);
+            let buffer = TimestampBuffer::new(self.config.buffer_timeout_secs, self.config.buffer_max_size);
+            let sliding_window = SlidingWindow::new(self.config.replay_window_size);
+            
+            SessionState {
+                crypto,
+                buffer,
+                pending_keys: HashMap::new(),
+                sliding_window,
+            }
+        })
+    }
+    
     pub fn receive_packet(&mut self, packet: Packet) -> A2FResult<Option<Vec<u8>>> {
-        if !self.sliding_window.check_and_record(packet.seq) {
+        let session_id = packet.session_id;
+        let session = self.get_or_create_session(session_id);
+        
+        if !session.sliding_window.check_and_record(packet.seq) {
             return Err(A2FError::ExpiredSequence(packet.seq));
         }
         
         match packet.payload_type {
             PayloadType::WrappedKey => {
-                let session_key = self.crypto.unwrap_session_key(&packet.payload)?;
-                self.pending_keys.insert(packet.timestamp, session_key);
+                let session_key = session.crypto.unwrap_session_key(&packet.payload)?;
+                session.pending_keys.insert(packet.timestamp, session_key);
                 
-                if let Some((_, data)) = self.buffer.insert_key(packet.timestamp, packet.payload) {
-                    let key = self.pending_keys.get(&packet.timestamp).unwrap();
-                    return Ok(Some(self.crypto.decrypt_data(key, &data)?));
+                if let Some((_, data)) = session.buffer.insert_key(packet.timestamp, packet.payload) {
+                    let key = session.pending_keys.get(&packet.timestamp).unwrap();
+                    return Ok(Some(session.crypto.decrypt_data(key, &data)?));
                 }
             }
             PayloadType::EncryptedData => {
-                if let Some(key) = self.pending_keys.get(&packet.timestamp) {
-                    return Ok(Some(self.crypto.decrypt_data(key, &packet.payload)?));
+                if let Some(key) = session.pending_keys.get(&packet.timestamp) {
+                    return Ok(Some(session.crypto.decrypt_data(key, &packet.payload)?));
                 }
                 
-                if let Some((wrapped_key, data)) = self.buffer.insert_data(packet.timestamp, packet.payload) {
-                    let key = self.crypto.unwrap_session_key(&wrapped_key)?;
-                    self.pending_keys.insert(packet.timestamp, key);
-                    return Ok(Some(self.crypto.decrypt_data(&key, &data)?));
+                if let Some((wrapped_key, data)) = session.buffer.insert_data(packet.timestamp, packet.payload) {
+                    let key = session.crypto.unwrap_session_key(&wrapped_key)?;
+                    session.pending_keys.insert(packet.timestamp, key);
+                    return Ok(Some(session.crypto.decrypt_data(&key, &data)?));
                 }
             }
             PayloadType::Dummy | PayloadType::Heartbeat => {}
@@ -240,15 +253,17 @@ impl A2FReceiver {
     }
     
     pub fn pending_count(&self) -> usize {
-        self.buffer.pending_count()
+        self.sessions.values().map(|s| s.buffer.pending_count()).sum()
     }
     
     pub fn clear_expired(&mut self) -> usize {
-        self.buffer.clear_expired()
+        let mut total = 0;
+        for session in self.sessions.values_mut() {
+            total += session.buffer.clear_expired();
+        }
+        total
     }
-    
-    #[allow(dead_code)]
-    pub fn current_min_seq(&self) -> u64 {
-        self.sliding_window.get_min_seq()
+    pub fn remove_session(&mut self, session_id: u64) -> Option<SessionState> {
+        self.sessions.remove(&session_id)
     }
 }

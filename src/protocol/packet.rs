@@ -12,6 +12,7 @@ pub enum PayloadType {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Packet {
+    pub session_id: u64,
     pub seq: u64,
     pub timestamp: u64,
     pub payload_type: PayloadType,
@@ -19,8 +20,9 @@ pub struct Packet {
 }
 
 impl Packet {
-    pub fn new(seq: u64, timestamp: u64, payload_type: PayloadType, payload: Vec<u8>) -> Self {
+    pub fn new(session_id: u64, seq: u64, timestamp: u64, payload_type: PayloadType, payload: Vec<u8>) -> Self {
         Self {
+            session_id,
             seq,
             timestamp,
             payload_type,
@@ -28,8 +30,9 @@ impl Packet {
         }
     }
     
-    pub fn dummy(seq: u64, timestamp: u64) -> Self {
+    pub fn dummy(session_id: u64, seq: u64, timestamp: u64) -> Self {
         Self {
+            session_id,
             seq,
             timestamp,
             payload_type: PayloadType::Dummy,
@@ -37,8 +40,9 @@ impl Packet {
         }
     }
     
-    pub fn heartbeat(seq: u64, timestamp: u64) -> Self {
+    pub fn heartbeat(session_id: u64, seq: u64, timestamp: u64) -> Self {
         Self {
+            session_id,
             seq,
             timestamp,
             payload_type: PayloadType::Heartbeat,
